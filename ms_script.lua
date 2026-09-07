@@ -20,6 +20,9 @@ local Settings = {
     AutoReveal        = false,
     AutoRevealDelay   = 0.05, -- Default delay (0.00 to 0.20 range)
     AutoFlagRange     = 30,    -- Studs from player; outside this, don't auto-flag (0 to 100 range)
+    DumbassMode       = false, -- Walk after another player (no CFrame teleporting)
+    FollowTarget      = nil,   -- Player name picked in the dropdown
+    FollowDistance    = 6,     -- Stop walking once this close to the target
     GuiEnabled        = true,
     GuessHelper       = true,
     SolverTickRate    = 0.15,
@@ -67,6 +70,8 @@ local data = {
     statusLabel    = nil,
     autoFlagBtn    = nil,
     autoRevealBtn  = nil,
+    followBtn      = nil,
+    followBlocked  = false,
     sliderLabel    = nil,
     sliderFill     = nil,
     rangeLabel     = nil,
@@ -258,6 +263,10 @@ local function buildGridGeometry(partsFolder)
 
     data.grid.w = #xs
     data.grid.h = #zs
+    -- Kept for pos -> cell lookups (the follow pathfinder needs them).
+    data.grid.xs, data.grid.zs = xs, zs
+    data.grid.sx = typicalSpacing(xs)
+    data.grid.sz = typicalSpacing(zs)
     if data.grid.w == 0 or data.grid.h == 0 then return end
 
     local planeY = sumY / #parts
@@ -984,6 +993,106 @@ local function updateBorders(hrpPos)
 end
 
 ----------------------------------------------------------------
+-- DUMBASS MODE (WALK-FOLLOW A PLAYER)
+----------------------------------------------------------------
+
+-- Grid cell under a world position, or nil when the position is off the board.
+local function cellIndexAt(pos)
+    local g = data.grid
+    if g.w == 0 or not g.xs then return nil end
+    local ix = nearestIndex(pos.X, g.xs)
+    local iz = nearestIndex(pos.Z, g.zs)
+    if math.abs(pos.X - g.xs[ix+1]) > g.sx * 0.75 then return nil end
+    if math.abs(pos.Z - g.zs[iz+1]) > g.sz * 0.75 then return nil end
+    return ix, iz
+end
+
+-- Standing on a cell is only safe once it is revealed, or once the solver has
+-- proven it clear. Unknown tiles are exactly what we refuse to walk over.
+local function isWalkableCell(cell)
+    if not cell then return false end
+    return cell.state == "number" or cell.state == "revealed_blank"
+        or data.cells.toClear[cell] ~= nil
+end
+
+local _bfsFrom = {}   -- reused between ticks; cleared on each search
+local _bfsDirs = { {1,0}, {-1,0}, {0,1}, {0,-1} }
+
+-- 4-neighbour BFS across walkable cells. Returns the first step to take toward
+-- the goal cell, or nil when no safe route exists.
+local function nextSafeStep(sx, sz, gx, gz)
+    if sx == gx and sz == gz then return nil end
+    table.clear(_bfsFrom)
+    local grid, w, h = data.cells.grid, data.grid.w, data.grid.h
+    local queue, head = { sx * h + sz }, 1
+    _bfsFrom[sx * h + sz] = -1
+    local goalKey = gx * h + gz
+    while head <= #queue do
+        local key = queue[head]; head += 1
+        local cx, cz = key // h, key % h
+        if key == goalKey then
+            -- Walk the parent chain back to the cell right after the start.
+            while _bfsFrom[key] ~= -1 and _bfsFrom[_bfsFrom[key]] ~= -1 do
+                key = _bfsFrom[key]
+            end
+            return grid[key // h][key % h]
+        end
+        for _, d in ipairs(_bfsDirs) do
+            local nx, nz = cx + d[1], cz + d[2]
+            if nx >= 0 and nx < w and nz >= 0 and nz < h then
+                local nkey = nx * h + nz
+                if not _bfsFrom[nkey] then
+                    local cell = grid[nx][nz]
+                    -- The goal cell itself is allowed even if unrevealed: it is
+                    -- where the target is standing, so it is safe by proof.
+                    if nkey == goalKey or isWalkableCell(cell) then
+                        _bfsFrom[nkey] = key
+                        queue[#queue+1] = nkey
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Humanoid:MoveTo is re-issued every tick: it is a one-shot goal and the
+-- target keeps moving. No CFrame writes, so this is plain walking.
+local function runFollow()
+    if not (Settings.DumbassMode and Settings.FollowTarget) then return end
+
+    local target = Players:FindFirstChild(Settings.FollowTarget)
+    local tHrp = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+    if not tHrp then return end
+
+    local char = Players.LocalPlayer and Players.LocalPlayer.Character
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not (hum and hrp) then return end
+
+    local delta = tHrp.Position - hrp.Position
+    if delta.Magnitude <= Settings.FollowDistance then
+        hum:MoveTo(hrp.Position)
+        data.followBlocked = false
+        return
+    end
+
+    local sx, sz = cellIndexAt(hrp.Position)
+    local gx, gz = cellIndexAt(tHrp.Position)
+    if sx and gx then
+        -- Both on the board: only step on tiles known not to be mines.
+        local step = nextSafeStep(sx, sz, gx, gz)
+        data.followBlocked = step == nil
+        hum:MoveTo(step and step.pos or hrp.Position)
+        return
+    end
+
+    data.followBlocked = false
+    -- Aim short of the target so we don't shove them around.
+    hum:MoveTo(tHrp.Position - delta.Unit * Settings.FollowDistance)
+end
+
+----------------------------------------------------------------
 -- STATUS HUD (WITH LIVE SLIDER)
 ----------------------------------------------------------------
 
@@ -1012,6 +1121,75 @@ local function createToggleButton(gui, xOffset, label, colorOn, settingKey)
 
     btn.MouseButton1Click:Connect(function()
         Settings[settingKey] = not Settings[settingKey]
+    end)
+    return btn
+end
+
+-- Dropdown listing every other player; picking one sets Settings.FollowTarget.
+-- The list is rebuilt on open, so joins/leaves need no event plumbing.
+local function createPlayerDropdown(gui, xOffset)
+    local btn = Instance.new("TextButton")
+    btn.Size            = UDim2.new(0, 150, 0, 36)
+    btn.Position        = UDim2.new(1, xOffset, 0, 122)
+    btn.BorderSizePixel = 0
+    btn.Font            = Enum.Font.GothamBold
+    btn.TextSize        = 12
+    btn.TextColor3      = Color3.new(1, 1, 1)
+    btn.AutoButtonColor = false
+    btn.BackgroundColor3 = OFF_COLOR
+    btn.Text            = "Dumbass Mode: OFF"
+    btn.Parent          = gui
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btn
+
+    local list = Instance.new("ScrollingFrame")
+    list.Size             = UDim2.new(0, 150, 0, 140)
+    list.Position         = UDim2.new(1, xOffset, 0, 160)
+    list.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    list.BorderSizePixel  = 0
+    list.ScrollBarThickness = 4
+    list.Visible          = false
+    list.Parent           = gui
+    local lc = Instance.new("UICorner"); lc.CornerRadius = UDim.new(0, 6); lc.Parent = list
+    local layout = Instance.new("UIListLayout"); layout.Parent = list
+
+    local function addRow(text, onClick)
+        local row = Instance.new("TextButton")
+        row.Size            = UDim2.new(1, 0, 0, 24)
+        row.BackgroundTransparency = 1
+        row.Font            = Enum.Font.Gotham
+        row.TextSize        = 12
+        row.TextColor3      = Color3.new(1, 1, 1)
+        row.Text            = text
+        row.Parent          = list
+        row.MouseButton1Click:Connect(onClick)
+    end
+
+    local function rebuild()
+        for _, child in ipairs(list:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+        addRow("(none - off)", function()
+            Settings.FollowTarget = nil
+            Settings.DumbassMode  = false
+            list.Visible = false
+        end)
+        local n = 1
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= Players.LocalPlayer then
+                n += 1
+                addRow(p.Name, function()
+                    Settings.FollowTarget = p.Name
+                    Settings.DumbassMode  = true
+                    list.Visible = false
+                end)
+            end
+        end
+        list.CanvasSize = UDim2.new(0, 0, 0, n * 24)
+    end
+
+    btn.MouseButton1Click:Connect(function()
+        list.Visible = not list.Visible
+        if list.Visible then rebuild() end
     end)
     return btn
 end
@@ -1118,6 +1296,7 @@ local function ensureStatusGui()
 
     data.autoFlagBtn = createToggleButton(gui, -540, "AutoFlag", FLAG_COLOR, "AutoFlag")
     data.autoRevealBtn = createToggleButton(gui, -380, "AutoReveal", GUESS_COLOR, "AutoReveal")
+    data.followBtn = createPlayerDropdown(gui, -220)
 
     data.sliderLabel, data.sliderFill = createSlider(gui, {
         y = 165, max = 0.20, color = GUESS_COLOR,
@@ -1189,6 +1368,13 @@ local function updateStatusGui()
 
     if data.autoRevealBtn then
         syncToggleButton(data.autoRevealBtn, "AutoReveal", Settings.AutoReveal, GUESS_COLOR)
+    end
+    if data.followBtn then
+        local on = Settings.DumbassMode and Settings.FollowTarget
+        data.followBtn.Text = on
+            and ((data.followBlocked and "Waiting: " or "Following: ") .. Settings.FollowTarget)
+            or "Dumbass Mode: OFF"
+        data.followBtn.BackgroundColor3 = on and SAFE_COLOR or OFF_COLOR
     end
 end
 
@@ -1270,6 +1456,10 @@ task.spawn(function()
     while not _stopped do
         local ok, err = pcall(function()
             local now = tick()
+
+            -- Follow runs before every board early-return so it keeps working
+            -- with the solver off or no grid loaded.
+            runFollow()
 
             if now - lastGridCheck > Settings.GridCheckInterval then
                 lastGridCheck = now
